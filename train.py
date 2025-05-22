@@ -9,7 +9,9 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import transforms
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR # Added CosineAnnealingLR
 from tqdm import tqdm
+from torch.cuda.amp import GradScaler # Added GradScaler
 
 from model import Classifier
 from dataset import ImageNetteDataset
@@ -67,7 +69,7 @@ def load_dataset(path, batch_size):
     return train_dataloader, val_dataloader
 
 
-def train_step(model, dataloader, optimizer, criterion, device, epoch=None, mix_aug=None):
+def train_step(model, dataloader, optimizer, criterion, device, scaler, epoch=None, mix_aug=None): # Added scaler
     """执行一个训练epoch
     
     工作流程:
@@ -89,7 +91,7 @@ def train_step(model, dataloader, optimizer, criterion, device, epoch=None, mix_
     返回:
         epoch平均loss和准确率
     """
-    running_loss, correct, total = [], 0, 0
+    running_loss, correct, total = [], 0, 0 # Ensure correct and total are initialized
     model.train()
 
     train_bar = tqdm(dataloader)
@@ -101,23 +103,31 @@ def train_step(model, dataloader, optimizer, criterion, device, epoch=None, mix_
 
         optimizer.zero_grad()
 
-        _, pred = model(x)
+        with torch.cuda.amp.autocast(): # Autocast for forward pass
+            _, pred = model(x) 
+            loss = criterion(pred, y)
 
-        loss = criterion(pred, y)
-        loss.backward()
-        optimizer.step()
-
-        # predicted_class = pred.argmax(dim=1, keepdim=False)
-
-        # total += y.numel()
-        # correct += (predicted_class == y).sum().item()
+        scaler.scale(loss).backward() # Scale loss
+        
+        # Gradient clipping:
+        scaler.unscale_(optimizer) # Unscale gradients before clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Clip gradients
+        
+        scaler.step(optimizer) # Scaler steps optimizer
+        scaler.update() # Update scaler
 
         running_loss.append(loss.item())
+        
+        # Accuracy calculation
+        predicted_class = pred.argmax(dim=1, keepdim=False)
+        total += y.numel()
+        correct += (predicted_class == y).sum().item()
+        
         train_bar.set_description(
             f'Epoch: [{epoch}] Loss: {round(sum(running_loss) / len(running_loss), 6)}')
-    # acc = correct / total
-    acc = None
-    return sum(running_loss) / len(running_loss), acc
+            
+    acc = correct / total if total > 0 else 0 # Calculate accuracy for the epoch
+    return sum(running_loss) / len(running_loss), acc # Return loss and accuracy
 
 
 def validation_step(model, dataloader, device):
@@ -184,20 +194,42 @@ def train(conf, device):
         logging.StreamHandler()
     ])
 
-    model = Classifier(n_classes=conf['DATASET'].getint('NUM_CLASSES'),
-                       num_ViGBlocks=conf['MODEL'].getint('DEPTH'),
-                       out_feature=conf['MODEL'].getint('DIMENSION'),
-                       num_edges=conf['MODEL'].getint('NUM_EDGES'),
-                       head_num=conf['MODEL'].getint('HEAD_NUM'))
+    # Read configuration values from conf object
+    patch_size_config = conf['MODEL'].getint('PATCH_SIZE')
+    dimension_config = conf['MODEL'].getint('DIMENSION') # For model_dimension_cfg and out_feature for VGNN
+    depth_config = conf['MODEL'].getint('DEPTH')         # For num_ViGBlocks for VGNN
+    num_edges_config = conf['MODEL'].getint('NUM_EDGES')
+    head_num_config = conf['MODEL'].getint('HEAD_NUM')   # Used for ViGBlock heads and patch_selector heads
+
+    # Get patchifier_type, defaulting to 'content_aware' if not in config
+    patchifier_type_config = conf['MODEL'].get('PATCHIFIER_TYPE', 'content_aware')
+
+    model = Classifier(
+        n_classes=conf['DATASET'].getint('NUM_CLASSES'),
+        patchifier_type=patchifier_type_config,
+        patch_size_cfg=patch_size_config,
+        model_dimension_cfg=dimension_config,
+        depth_cfg=depth_config,
+        num_edges_cfg=num_edges_config,
+        head_num_cfg=head_num_config
+        # hidden_layer uses its default in Classifier
+    )
     model.to(device)
     logging.info('Model loaded')
     logging.info({section: dict(conf[section]) for section in conf.sections()})
+
+    # The following line for patchifier_type_config was placed incorrectly by a previous step,
+    # it's now correctly handled above before Classifier instantiation.
+    # patchifier_type_config = conf['MODEL'].get('PATCHIFIER_TYPE', 'content_aware') 
 
     train_dataloader, val_dataloader = load_dataset(
         conf['DATASET']['PATH'], conf['TRAIN'].getint('BATCH_SIZE'))
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=conf['TRAIN'].getfloat('LR'))
+    optimizer = optim.Adam(model.parameters(), lr=0.0001) # Use hardcoded LR
+    scheduler = CosineAnnealingLR(optimizer, T_max=conf['TRAIN'].getint('EPOCHS')) # Instantiate Scheduler
+
+    scaler = GradScaler() # Instantiate GradScaler
 
     loss_hisroty, train_acc_hist, val_acc_hist = [], [], []
     max_val_acc = 0
@@ -209,7 +241,7 @@ def train(conf, device):
     for epoch in range(1, conf['TRAIN'].getint('EPOCHS')+1):
 
         loss, train_acc = train_step(
-            model, train_dataloader, optimizer, criterion, device, epoch)
+            model, train_dataloader, optimizer, criterion, device, scaler, epoch) # Pass scaler
         # 修改这里以接收预测结果
         val_acc, epoch_preds, epoch_targets = validation_step(model, val_dataloader, device)
 
@@ -217,7 +249,7 @@ def train(conf, device):
         train_acc_hist.append(train_acc)
         val_acc_hist.append(val_acc)
 
-        logging.info(f'Epoch: {epoch}, Loss: {loss}, Val acc: {val_acc*100}')
+        logging.info(f'Epoch: {epoch}, Loss: {loss}, Train acc: {train_acc*100 if train_acc is not None else "N/A"}, Val acc: {val_acc*100}')
 
         if val_acc > max_val_acc:
             max_val_acc = val_acc
@@ -228,6 +260,8 @@ def train(conf, device):
         visualizer.plot_training_curves(loss_hisroty, val_acc_hist, 
                                       train_acc_hist, val_acc_hist)
         
+        scheduler.step() # Step the scheduler
+
         # 每10个epoch保存一次完整的分析结果
         if (epoch + 1) % 10 == 0:
             # 使用当前epoch的预测结果绘制混淆矩阵

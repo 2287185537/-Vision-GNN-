@@ -79,28 +79,52 @@ class VGNN(nn.Module):
     4. ViGBlock序列: 多层图神经网络处理单元
     
     参数:
-        in_features: patch的原始特征维度(3*patch_size*patch_size)
-        out_feature: 输出特征维度
-        num_patches: patch的总数(H*W/patch_size^2)
+        in_features: patch的原始特征维度 (dimension of each patch feature vector after patchifier)
+        out_feature: 输出特征维度 (dimension of ViG network)
+        num_patches: patch的总数(H*W/patch_size^2) - used for initial pose_embedding, but dynamically adjusted
         num_ViGBlocks: ViGBlock的层数
         num_edges: 每个节点的连接边数
-        head_num: 注意力头数量
+        head_num: 注意力头数量 (for ViGBlock)
+        patchifier_type: 类型 of patchifier ('simple' or 'content_aware')
+        # Parameters for ContentAwarePatchifier
+        patch_size_for_patchifier: int,
+        dimension_for_patchifier: int, # This is the 'dimension' (e.g. model dimension) for patchifier's internal CNN
+        num_heads_for_patchifier: int,
     """
-    def __init__(self, in_features=3*16*16, out_feature=320, num_patches=196,
-                 num_ViGBlocks=16, num_edges=9, head_num=1, patchifier_type='simple'):
+    def __init__(self, in_features, out_feature, num_ViGBlocks, num_edges, head_num, # ViG Core Params
+                 patchifier_type, # Patchifier general param
+                 # Specific params for ContentAwarePatchifier (if used)
+                 patch_size_for_patchifier=None, 
+                 dimension_for_patchifier=None, 
+                 num_heads_for_patchifier=None,
+                 num_patches=196): # num_patches kept for compatibility, pose_embedding is dynamic
         super().__init__()
 
-        # 根据参数选择patchifier类型
-        if patchifier_type == 'simple':
-            self.patchifier = SimplePatchifier()
-        else:  # patchifier_type == 'content_aware'
+        self.patchifier_type = patchifier_type
+        if self.patchifier_type == 'simple':
+            # Assuming SimplePatchifier default patch_size=16.
+            # If patch_size_for_patchifier is provided, SimplePatchifier might need it.
+            # For now, SimplePatchifier is not changed to accept patch_size.
+            self.patchifier = SimplePatchifier() 
+            # in_features for VGNN should be patch_size * patch_size * 3 for SimplePatchifier
+        elif self.patchifier_type == 'content_aware':
+            if patch_size_for_patchifier is None or dimension_for_patchifier is None or num_heads_for_patchifier is None:
+                raise ValueError("Missing parameters for ContentAwarePatchifier")
             self.patchifier = ContentAwarePatchifier(
-                in_channels=3,
-                top_k="half"
+                in_channels=3, # Assuming 3 input channels for images
+                patch_size=patch_size_for_patchifier,
+                dimension=dimension_for_patchifier, # This is the 'DIMENSION' from config for CAP internal CNN
+                num_heads=num_heads_for_patchifier,
+                top_k="half" # This could also be a parameter
             )
+            # ContentAwarePatchifier outputs patches of dimension:
+            # calculated_patch_dim = patch_size_for_patchifier * patch_size_for_patchifier * in_channels (3)
+            # So, VGNN's in_features must match this.
+        else:
+            raise ValueError(f"Unknown patchifier_type: {patchifier_type}")
             
         self.patch_embedding = nn.Sequential(
-            nn.Linear(in_features, out_feature//2),  # 恢复使用in_features
+            nn.Linear(in_features, out_feature//2), # in_features must match patchifier's output patch dim
             nn.BatchNorm1d(out_feature//2),
             nn.GELU(),
             nn.Linear(out_feature//2, out_feature//4),
@@ -163,15 +187,35 @@ class Classifier(nn.Module):
         features: 图结构特征
         logits: 类别预测概率
     """
-    def __init__(self, in_features=3*16*16, out_feature=320,
-                 num_patches=196, num_ViGBlocks=16, hidden_layer=1024,
-                 num_edges=9, head_num=1, n_classes=10, patchifier_type='simple'):
+    def __init__(self, n_classes, patchifier_type,
+                 patch_size_cfg, model_dimension_cfg, depth_cfg, num_edges_cfg, head_num_cfg, 
+                 hidden_layer=1024): # Other params like n_classes, hidden_layer
         super().__init__()
         
-        self.backbone = VGNN(in_features, out_feature,
-                             num_patches, num_ViGBlocks,
-                             num_edges, head_num,
-                             patchifier_type=patchifier_type)  # 传递patchifier类型参数
+        # Determine in_features for VGNN based on patch_size_cfg
+        # This is the dimension of the patches output by the patchifier
+        # For both SimplePatchifier and ContentAwarePatchifier (after its projection layer),
+        # this should be patch_size_cfg * patch_size_cfg * 3 (assuming 3 input image channels)
+        vggn_in_features = patch_size_cfg * patch_size_cfg * 3
+        
+        # num_patches for VGNN, can be calculated or default. Pose embedding is dynamic anyway.
+        # Assuming image size 224x224 for this calculation if needed, though not strictly necessary
+        # for VGNN due to dynamic pose embedding.
+        num_patches_for_vggn = (224 // patch_size_cfg)**2
+
+        self.backbone = VGNN(
+            in_features=vggn_in_features,
+            out_feature=model_dimension_cfg, 
+            num_ViGBlocks=depth_cfg,
+            num_edges=num_edges_cfg,
+            head_num=head_num_cfg, # This is for ViGBlock attention heads
+            patchifier_type=patchifier_type,
+            # New parameters for ContentAwarePatchifier
+            patch_size_for_patchifier=patch_size_cfg,
+            dimension_for_patchifier=model_dimension_cfg, # Passed as 'dimension' to ContentAwarePatchifier
+            num_heads_for_patchifier=head_num_cfg, # Assuming same HEAD_NUM from config for patch selector heads
+            num_patches=num_patches_for_vggn 
+        )
         
         # 注意：现在使用动态特征维度
         self.predictor = nn.Sequential(
