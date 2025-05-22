@@ -12,20 +12,10 @@
 - 优化的内存使用和计算效率
 """
 
-import configparser
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# 读取配置文件
-conf = configparser.ConfigParser()
-conf.read('/workspace/实验/output/confs/main.ini')
-
-# 从配置文件获取模型的关键参数
-PATCH_SIZE = int(conf['MODEL']['PATCH_SIZE'])  # patch的大小（边长）
-DIMENSION = int(conf['MODEL']['DIMENSION'])     # 特征维度
-HEAD_NUM = int(conf['MODEL']['HEAD_NUM'])      # 注意力头的数量
 
 class PatchSelector(nn.Module):
     """轻量级多头注意力patch选择器
@@ -41,11 +31,11 @@ class PatchSelector(nn.Module):
     3. 使用1x1卷积高效融合多头信息
     4. 动态选择top-k个重要patches
     """
-    def __init__(self, patch_dim=DIMENSION, num_heads=HEAD_NUM, top_k=None):
+    def __init__(self, patch_dim, num_heads, top_k=None):
         super().__init__()
         
         self.num_heads = num_heads
-        self.head_dim = patch_dim // num_heads
+        self.head_dim = patch_dim // self.num_heads # Ensure this uses the parameter
         
         # 轻量级注意力网络
         self.attention = nn.ModuleList([
@@ -53,11 +43,11 @@ class PatchSelector(nn.Module):
                 nn.Linear(patch_dim, self.head_dim),
                 nn.GELU(),
                 nn.Linear(self.head_dim, 1, bias=False)  # 移除偏置项减少参数
-            ) for _ in range(num_heads)
+            ) for _ in range(self.num_heads) # Use self.num_heads
         ])
         
         # 简化的特征融合
-        self.fusion = nn.Conv1d(num_heads, 1, 1, bias=False)
+        self.fusion = nn.Conv1d(self.num_heads, 1, 1, bias=False) # Use self.num_heads
         self.layer_norm = nn.LayerNorm(patch_dim)
         self.top_k = top_k
 
@@ -121,22 +111,24 @@ class ImportanceScorer(nn.Module):
     - 采用两层线性变换with GELU激活
     - Sigmoid输出确保分数在[0,1]范围
     """
-    def __init__(self, patch_dim=DIMENSION):
+    def __init__(self, patch_dim): # Removed default tied to global
         super().__init__()
         
         # 轻量级重要性评分网络
         self.importance_net = nn.Sequential(
-            nn.Linear(patch_dim, patch_dim // 4),  # 大幅减少中间层维度
+            nn.Linear(patch_dim, patch_dim // 4),
             nn.GELU(),
             nn.Linear(patch_dim // 4, 1, bias=False),
             nn.Sigmoid()
         )
         
         # 简化位置编码
-        pe = self._create_position_embedding(196, patch_dim)
+        # Assuming 196 is a fixed length for now, e.g., (224/16)^2 = 14^2 = 196
+        # If this needs to be dynamic, length should also be a parameter.
+        pe = self._create_position_embedding(196, patch_dim) # Use patch_dim for dim
         self.register_buffer('pos_embedding', pe)
         
-    def _create_position_embedding(self, length, dim):
+    def _create_position_embedding(self, length, dim): # dim comes from patch_dim
         """生成正弦位置编码
         
         使用正弦和余弦函数生成位置编码，提供位置信息。
@@ -173,14 +165,14 @@ class EnhancedPatchSelector(PatchSelector):
     - 特征融合使用1x1卷积
     - 采用无偏置线性层减少参数
     """
-    def __init__(self, patch_dim=DIMENSION, num_heads=HEAD_NUM, top_k=None):
-        super().__init__(patch_dim, num_heads, top_k)
+    def __init__(self, patch_dim, num_heads, top_k=None): # Removed defaults
+        super().__init__(patch_dim, num_heads, top_k) # Pass params to parent
         
-        self.importance_scorer = ImportanceScorer(patch_dim)
+        self.importance_scorer = ImportanceScorer(patch_dim) # Pass patch_dim
         
         # 轻量级特征增强
         self.feature_enhancer = nn.Sequential(
-            nn.Linear(patch_dim, patch_dim, bias=False),
+            nn.Linear(patch_dim, patch_dim, bias=False), # Use patch_dim
             nn.GELU()
         )
         
@@ -249,42 +241,73 @@ class ContentAwarePatchifier(nn.Module):
     - 可配置参数：patch大小、特征维度、头数
     
     优化设计：
-    - 中间特征降维到DIMENSION//4
+    - 中间特征降维到dimension//4
     - 使用1x1卷积替代3x3提升效率
     - 批处理优化减少内存占用
     """
-    def __init__(self, in_channels=3, top_k="half"):
+    def __init__(self, patch_size, dimension, num_heads, in_channels=3, top_k="half"): # Added params
         super().__init__()
         
         # 高效特征提取
-        mid_dim = DIMENSION // 4  # 减少中间特征维度
+        mid_dim = dimension // 4  # Use parameter: dimension
         self.patchifier = nn.Sequential(
             nn.Conv2d(in_channels, mid_dim,
-                     kernel_size=PATCH_SIZE,
-                     stride=PATCH_SIZE,
-                     bias=False),  # 移除偏置项
+                     kernel_size=patch_size, # Use parameter: patch_size
+                     stride=patch_size,      # Use parameter: patch_size
+                     bias=False),
             nn.BatchNorm2d(mid_dim),
             nn.GELU(),
-            nn.Conv2d(mid_dim, DIMENSION,
-                     kernel_size=1,  # 使用1x1卷积代替3x3
+            nn.Conv2d(mid_dim, dimension,    # Use parameter: dimension
+                     kernel_size=1,
                      bias=False)
         )
         
-        # 计算每个patch的特征维度
-        self.patch_dim = PATCH_SIZE * PATCH_SIZE * in_channels
+        # 计算图像被划分后的patch数量 (assuming image size 224x224 is fixed)
+        self.num_patches = (224 // patch_size) ** 2  # Use parameter: patch_size
         
-        # 计算图像被划分后的patch数量
-        self.num_patches = (224 // PATCH_SIZE) ** 2  # 输入图像大小为224x224
-        
-        # 调整特征维度
-        self.feature_proj = nn.Linear(DIMENSION, self.patch_dim)
-        
+        # 调整特征维度 - This seems to project from `dimension` (from Conv2D) to `patch_dim_flattened`
+        # If patchifier's output is already `dimension`, and selector expects `patch_dim_flattened`
+        # that is `dimension`, then this projection might be redundant if DIMENSION was self.patch_dim_flattened.
+        # The original code had: self.feature_proj = nn.Linear(DIMENSION, self.patch_dim)
+        # where self.patch_dim = PATCH_SIZE * PATCH_SIZE * in_channels.
+        # And EnhancedPatchSelector expected patch_dim = self.patch_dim.
+        # The output of self.patchifier is C=DIMENSION.
+        # So, the selector should expect `dimension` as its `patch_dim`.
+        # Let's clarify:
+        # The PatchSelector and its derivatives expect `patch_dim` as the feature dimension of each patch.
+        # The `self.patchifier` outputs features of channel `dimension`.
+        # The reshape `patches.permute(0, 2, 3, 1).reshape(B, H*W, C)` makes C (which is `dimension`) the feature dim.
+        # So, `EnhancedPatchSelector` should be initialized with `patch_dim=dimension`.
+        # The `self.feature_proj` seems to be an error in my previous reasoning or the original code's intent.
+        # If `patchifier` outputs `dimension`, and selector takes `dimension`, then `feature_proj` is not needed
+        # if its job was to map to what the selector expects.
+        # Original: self.patch_dim = PATCH_SIZE * PATCH_SIZE * in_channels
+        # Original: self.feature_proj = nn.Linear(DIMENSION, self.patch_dim)
+        # Original selector took patch_dim = self.patch_dim
+        # This implies the output of patchifier (DIMENSION) was projected to (PATCH_SIZE * PATCH_SIZE * in_channels)
+        # This is unusual. Typically ConvNet features are used directly.
+        # Let's stick to the original structure for now, assuming there was a reason.
+        # The input to EnhancedPatchSelector is `patches` which has feature dimension C from `patchifier`.
+        # C is `dimension` (the new parameter name for the old global DIMENSION).
+        # So `EnhancedPatchSelector` should receive `patch_dim=dimension`.
+        # The `self.feature_proj` layer in the original code projected from `DIMENSION` to `PATCH_SIZE * PATCH_SIZE * in_channels`.
+        # This `self.patch_dim` was then passed to `EnhancedPatchSelector`.
+        # This is a bit confusing. Let's re-evaluate:
+        # 1. `patchifier` outputs `B, dimension, H, W`.
+        # 2. `process_patches` reshapes to `B, H*W, dimension`.
+        # 3. This is then fed to `self.feature_proj`.
+        # 4. `self.feature_proj` projects from `dimension` to `calculated_patch_dim = patch_size * patch_size * in_channels`.
+        # 5. This `calculated_patch_dim` is what `EnhancedPatchSelector` expects as `patch_dim`.
+
+        self.calculated_patch_dim = patch_size * patch_size * in_channels # This is what selector expects as patch_dim
+        self.feature_proj = nn.Linear(dimension, self.calculated_patch_dim) # Projects from CNN output dim to selector input dim
+
         # 设置top_k为patch总数的一半
-        actual_top_k = self.num_patches // 2 if top_k == "half" else top_k
+        actual_top_k = self.num_patches // 2 if top_k == "half" else int(top_k) # Ensure top_k is int
         
         self.selector = EnhancedPatchSelector(
-            patch_dim=self.patch_dim,
-            num_heads=HEAD_NUM,
+            patch_dim=self.calculated_patch_dim, # This is the dimension selector operates on
+            num_heads=num_heads,                 # Use parameter: num_heads
             top_k=actual_top_k
         )
         
